@@ -1,0 +1,21 @@
+server:
+  build: .
+  environment:
+    DISPLAY: 192.168.59.3:0
+  command: python3 /code/MBserver465.pyc --version C --postdrop 0.5 --getdrop 0.5 --ber 0.5 --delay 1
+client:
+  build: .
+  volumes:
+    - .:/code/
+  links:
+    - server
+    - wdb
+  command: python3 /code/messenger465_client.py --host server --username saul --timeout 2
+  environment:
+    DISPLAY: 192.168.59.3:0
+    WDB_SOCKET_SERVER: wdb
+    WDB_NO_BROWSER_AUTO_OPEN: True
+wdb:
+  image: saulshanabrook/wdb-server
+  ports:
+    - "1984:1984"
