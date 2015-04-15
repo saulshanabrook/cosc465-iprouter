@@ -8,6 +8,8 @@ import ipaddress
 import datetime
 import inspect
 import copy
+import functools
+import types
 
 # from typing import Dict, List, Sequence, Any
 # i am commenting this out, because you probably don't have mypy installed
@@ -15,6 +17,7 @@ import copy
 import switchyard.lib.packet as packet
 import switchyard.lib.common as common
 
+#from debug_logging import DebugMetaClass
 
 def in_in(dictionary, item):
     '''
@@ -36,7 +39,7 @@ def get_in(dictionary, item):
     for (key, value) in dictionary.items():
         if item in key:
             return value
-    raise KeyError()
+    raise KeyError("{} not in {}".format(str(item), str(dictionary)))
 
 
 def sort_network_dict(dictionary):
@@ -49,33 +52,56 @@ def sort_network_dict(dictionary):
     ))
 
 
-class DebugBase(object):
+def set_header(pkt, new_header):
+    TRANSPORT_LAYER_INDEX = 2
 
-    '''
-    Logs whenever a method is called on a class
-    '''
+    header_class = new_header.__class__
 
-    def __getattribute__(self, name):
-        returned = object.__getattribute__(self, name)
-        if inspect.isfunction(returned) or inspect.ismethod(returned):
-            common.log_debug('called ' + returned.__name__)
-        return returned
+    header_index = pkt.get_header_index(header_class)
+    if header_index == -1:
+        # this means that the header currently doesn't exist in this class
+        if isinstance(new_header, packet.ICMP) or isinstance(new_header, packet.IPv4):
+            header_index = TRANSPORT_LAYER_INDEX
+        else:
+            raise RuntimeError(
+                "Dont know where to update header {}".format(str(new_header))
+            )
+    pkt[header_index] = new_header
 
+
+    if header_index == TRANSPORT_LAYER_INDEX:
+        # if we changed the transport protocal, we should also change it on the
+        # ip packet
+        pkt[pkt.get_header_index(packet.IPv4)].protocol = getattr(
+            packet.IPProtocol,
+            header_class.__name__
+        )
+
+        # if we updated the transport layer header, we should remove all packets
+        # after it
+        while len(list(pkt)) > (header_index + 1):
+            del pkt[len(list(pkt)) - 1]
 
 class ARPRequestInfo(object):
-
-    def __init__(self, request_number: int, sent_time: datetime.datetime):
+    def __init__(self, request_number: int, sent_time: datetime.datetime) -> None:
         self.request_number = request_number
         self.sent_time = sent_time
 
-    def __repr__(self):
+    def __str__(self):
         return 'request_number: {} sent_time: {}'.format(self.request_number, self.sent_time)
 
 
-class Router(DebugBase):
+# class Router(metaclass=DebugMetaClass, log_function=common.log_debug):
+class Router():
     TABLE_FILE = 'forwarding_table.txt'
     ARP_REQUEST_MAX_TRIES = 5
     ARP_REQUEST_TIMEOOUT = datetime.timedelta(seconds=1)
+    IP_TTL = 64 # from http://superuser.com/a/721762
+
+    # placeholder that you can set the srcip of a IP header of a packet
+    # so that when it gets sent it will be changed to the IP of the
+    # interface sending it
+    IP_OF_SENDING_INTERFACE = object()
 
     # list of addresses that are internal (IPs of interfaces)
     internal_address = []  # type: List[ipaddress.IPv4Address]
@@ -104,6 +130,10 @@ class Router(DebugBase):
     def __init__(self, net):
         self.net = net
 
+        print('Network interfaces')
+        for interface in self.net.interfaces():
+            print('{0.ipaddr} {0.netmask} {0.name} {0.ethaddr}'.format(interface))
+
         # add all internal IP -> mac pairs
         for interface in self.net.interfaces():
             network = ipaddress.IPv4Network('{0.ipaddr}/{0.netmask}'.format(interface), strict=False)
@@ -128,32 +158,13 @@ class Router(DebugBase):
         packets until the end of time.
         '''
         while True:
-            # lets iterate through all our current arp requests and see if
-            # any have timed out
-            for (ip, arp_request_info) in copy.copy(self.current_arp_requests).items():
-                timeout_time = arp_request_info.sent_time + self.ARP_REQUEST_TIMEOOUT
-                if timeout_time < datetime.datetime.now():
-                    # if we have sent the max number already, then remove
-                    # from list so we stop trying to send and drop
-                    # all packets which we were waiting on
-                    if arp_request_info.request_number >= self.ARP_REQUEST_MAX_TRIES:
-                        del self.current_arp_requests[ip]
-                        del self.waiting_on_arp[ip]
-                    else:
-                        # otherwise we can try to send it again
-                        arp_request_info.request_number += 1
-                        common.log_debug('sending ARP request: try #{}'.format(
-                            arp_request_info.request_number
-                        ))
-                        self.send_arp_request(ip)
-
+            self.check_arp_timeouts()
             try:
                 dev, pkt = self.net.recv_packet(timeout=1.0)
             except common.NoPackets:
                 continue
             except common.Shutdown:
                 return
-            common.log_debug('recieved packet: {}'.format(pkt))
             if pkt.has_header(packet.Arp):
                 if pkt.get_header(packet.Arp).operation == packet.ArpOperation.Request:
                     self.send_arp_reply(dev, pkt)
@@ -163,6 +174,41 @@ class Router(DebugBase):
                 self.process_ipv4(pkt)
             else:
                 common.log_debug('got a packet, but didnt know how to process it: {}'.format(pkt))
+
+    def check_arp_timeouts(self):
+        # lets iterate through all our current arp requests and see if
+        # any have timed out
+        for (ip, arp_request_info) in copy.copy(self.current_arp_requests).items():
+            timeout_time = arp_request_info.sent_time + self.ARP_REQUEST_TIMEOOUT
+            if timeout_time < datetime.datetime.now():
+                # if we have sent the max number already, then remove
+                # from list so we stop trying to send
+                if arp_request_info.request_number >= self.ARP_REQUEST_MAX_TRIES:
+                    while self.waiting_on_arp[ip]:
+                        pkt = self.waiting_on_arp[ip].popleft()
+                        self.modify_pkt(
+                            pkt,
+                            new_header=self.generate_icmp_error(
+                                pkt,
+                                icmptype=packet.ICMPType.DestinationUnreachable,
+                                icmpcode_name="HostUnreachable"
+                            ),
+                            srcip=self.IP_OF_SENDING_INTERFACE
+                        )
+                        ip_header = pkt.get_header(packet.IPv4)
+                        self.try_forwarding_ipv4(pkt, self.get_next_hop(ip_header.dstip))
+                    del self.current_arp_requests[ip]
+                    del self.waiting_on_arp[ip]
+                else:
+                    # otherwise we can try to send it again
+                    arp_request_info.request_number += 1
+                    common.log_debug('sending ARP request: try #{}'.format(
+                        arp_request_info.request_number
+                    ))
+                    self.send_arp_request(ip)
+
+    def send_packet(self, interface_name, request):
+        self.net.send_packet(interface_name, request)
 
     def send_arp_reply(self, dev: str, pkt: packet.Packet):
         arp = pkt.get_header(packet.Arp)
@@ -174,7 +220,7 @@ class Router(DebugBase):
                 targetip=arp.senderprotoaddr,
 
             )
-            self.net.send_packet(dev, reply)
+            self.send_packet(dev, reply)
 
     def send_arp_request(self, ip: ipaddress.IPv4Address):
         sending_interface = get_in(self.network_to_interface, ip)
@@ -183,7 +229,7 @@ class Router(DebugBase):
             srcip=sending_interface.ipaddr,
             targetip=ip,
         )
-        self.net.send_packet(sending_interface.name, request)
+        self.send_packet(sending_interface.name, request)
 
     def process_arp_reply(self, pkt: packet.Packet):
         arp = pkt.get_header(packet.Arp)
@@ -198,23 +244,64 @@ class Router(DebugBase):
     def process_ipv4(self, pkt: packet.Packet):
         ip = pkt.get_header(packet.IPv4)
 
-        # if dest in internal network, then drop packet
         if ip.dstip in self.internal_address:
-            return
-        # if right next to router, can send w/ out next hop
-        if in_in(self.internal_network_to_mac, ip.dstip):
-            self.try_forwarding_ipv4(pkt, ip.dstip)
-            return
-        # ok so we have determined we need to get one hope away to reach
-        # it, if we have don't have that next hope we can drop
-        if not in_in(self.network_to_next_hop, ip.dstip):
-            return
-        self.try_forwarding_ipv4(pkt, get_in(self.network_to_next_hop, ip.dstip))
+            icmp = pkt.get_header(packet.ICMP)
+            if icmp and icmp.icmptype == packet.ICMPType.EchoRequest:
+                self.modify_pkt(
+                    pkt,
+                    new_header=self.generate_icmp_echo_reply(icmp),
+                    srcip=ip.dstip
+                )
+            else:
+                self.modify_pkt(
+                    pkt,
+                    new_header=self.generate_icmp_error(
+                        pkt,
+                        icmptype=packet.ICMPType.DestinationUnreachable,
+                        icmpcode_name="PortUnreachable"
+                    ),
+                    srcip=self.IP_OF_SENDING_INTERFACE
+                )
+        else:
+            ip.ttl -= 1
+            if ip.ttl <= 0:
+                self.modify_pkt(
+                    pkt,
+                    new_header=self.generate_icmp_error(
+                        pkt,
+                        icmptype=packet.ICMPType.TimeExceeded,
+                        icmpcode_name="TTLExpired",
+                    ),
+                    srcip=self.IP_OF_SENDING_INTERFACE
+                )
 
-    def try_forwarding_ipv4(self, pkt: packet.Packet, next_hop: ipaddress.IPv4Address):
+        try:
+            next_hop = self.get_next_hop(ip.dstip)
+        except KeyError:
+            # If we cant find that next hop, then wen need to send out an error
+            self.modify_pkt(
+                pkt,
+                new_header=self.generate_icmp_error(
+                    pkt,
+                    icmptype=packet.ICMPType.DestinationUnreachable,
+                    icmpcode_name="NetworkUnreachable",
+                ),
+                srcip=self.IP_OF_SENDING_INTERFACE
+            )
+            next_hop = self.get_next_hop(ip.dstip)
+
+        self.try_forwarding_ipv4(pkt, next_hop)
+
+    def get_next_hop(self, ip: ipaddress.IPv4Address) -> ipaddress.IPv4Address:
+        # if right next to router, can send w/ out next hop
+        if in_in(self.internal_network_to_mac, ip):
+            return ip
+        return get_in(self.network_to_next_hop, ip)
+
+    def try_forwarding_ipv4(self, pkt: packet.Packet, next_hop: ipaddress.IPv4Address) -> None:
         '''
         will forward an ip packet, but first makes sure we know the mac address
-        of the destination. if we don't, then we can add it to queue
+        of the next hop. if we don't, then we can add it to queue
         and process it later
         '''
         # if we know the mac of the destination ip, we can go ahead and send the
@@ -234,16 +321,50 @@ class Router(DebugBase):
     def forward_ipv4_packet(self, pkt: packet.Packet, next_hop: ipaddress.IPv4Address):
         ip = pkt.get_header(packet.IPv4)
 
-        ip.ttl -= 1
-
         ethernet = pkt.get_header(packet.Ethernet)
         next_hop_mac = get_in(self.network_to_mac, next_hop)
-        output_interface = get_in(self.network_to_interface, next_hop)
+        output_interface = get_in(self.network_to_interface, ip.dstip)
 
         ethernet.src = output_interface.ethaddr
         ethernet.dst = next_hop_mac
 
-        self.net.send_packet(output_interface.name, pkt)
+        if ip.srcip == ip.dstip:
+            ip.srcip = output_interface.ipaddr
+
+        self.send_packet(output_interface.name, pkt)
+
+    def generate_icmp_echo_reply(self, icmp_request):
+        icmp_response = packet.ICMP()
+        icmp_response.icmptype = packet.common.ICMPType.EchoReply
+        icmp_response.icmpdata.data = icmp_request.icmpdata.data
+        icmp_response.icmpdata.identifier = icmp_request.icmpdata.identifier
+        icmp_response.icmpdata.sequence = icmp_request.icmpdata.sequence
+        return icmp_response
+
+    def generate_icmp_error(self, pkt, icmptype, icmpcode_name):
+        icmp = packet.ICMP()
+        icmp.icmptype = icmptype
+        for icmpcode in packet.ICMPTypeCodeMap[icmptype]:
+            if icmpcode.name == icmpcode_name:
+                icmp.icmpcode = icmpcode
+
+        pkt_without_ethernet = copy.copy(pkt)
+        del pkt_without_ethernet[pkt.get_header_index(packet.Ethernet)]
+        icmp.icmpdata.data = pkt_without_ethernet.to_bytes()[:28]
+
+        return icmp
+
+    def modify_pkt(self, pkt, new_header, srcip=IP_OF_SENDING_INTERFACE):
+        set_header(pkt, new_header)
+        ip = pkt.get_header(packet.IPv4)
+
+        # if we want the the source ip to that of the interface sending
+        # we can set the IPs to be the same and check for it later
+        # when we know the sending interface
+        if srcip == self.IP_OF_SENDING_INTERFACE:
+            srcip = ip.srcip
+        ip.srcip, ip.dstip = srcip, ip.srcip
+        ip.ttl = self.IP_TTL
 
 
 def switchy_main(net):
